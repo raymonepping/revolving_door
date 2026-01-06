@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vault-door-frontend
+  namespace: default
+  labels:
+    app: vault-door-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vault-door-frontend
+  template:
+    metadata:
+      labels:
+        app: vault-door-frontend
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: web
+              mountPath: /usr/share/nginx/html/index.html
+              subPath: index.html
+              readOnly: true
+      volumes:
+        - name: web
+          configMap:
+            name: vault-door-frontend

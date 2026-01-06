@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: door-close
+  namespace: default
+spec:
+  schedule: "0 0 1 1 *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          serviceAccountName: door-operator
+          restartPolicy: Never
+          volumes:
+            - name: vault-auth
+              emptyDir: {}
+          initContainers:
+            - name: vault-auth
+              image: hashicorp/vault:1.20.4
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-lc"]
+              env:
+                - name: VAULT_ADDR
+                  value: http://vault.vault.svc:8200
+              args:
+                - |
+                  set -euo pipefail
+                  JWT="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+                  vault write -field=token auth/kubernetes/login role="door-operator" jwt="$JWT" > /vault/token
+                  chmod 0640 /vault/token
+                  echo "✅ Token written to /vault/token"
+              volumeMounts:
+                - name: vault-auth
+                  mountPath: /vault
+
+            - name: vault-close
+              image: hashicorp/vault:1.20.4
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-lc"]
+              env:
+                - name: VAULT_ADDR
+                  value: http://vault.vault.svc:8200
+              args:
+                - |
+                  set -euo pipefail
+                  export VAULT_TOKEN="$(cat /vault/token)"
+
+                  echo "🔒 Setting Vault k8s role policy to deny-db-read"
+                  vault write auth/kubernetes/role/demo-backend \
+                    bound_service_account_names="demo-backend" \
+                    bound_service_account_namespaces="default" \
+                    policies="deny-db-read" \
+                    ttl="24h" \
+                    audience="https://kubernetes.default.svc.cluster.local"
+
+                  echo "🧨 Revoking DB leases (locks immediately)"
+                  vault lease revoke -prefix "database/creds/app-role" || true
+              volumeMounts:
+                - name: vault-auth
+                  mountPath: /vault
+
+            - name: restart
+              image: rancher/kubectl:v1.35.0
+              imagePullPolicy: IfNotPresent
+              command: ["kubectl"]
+              args: ["-n", "default", "rollout", "restart", "deploy/demo-backend"]
+
+            - name: status
+              image: rancher/kubectl:v1.35.0
+              imagePullPolicy: IfNotPresent
+              command: ["kubectl"]
+              args: ["-n", "default", "rollout", "status", "deploy/demo-backend", "--timeout=180s"]
+
+          containers:
+            - name: done
+              image: rancher/kubectl:v1.35.0
+              imagePullPolicy: IfNotPresent
+              command: ["kubectl"]
+              args: ["version", "--client=true"]

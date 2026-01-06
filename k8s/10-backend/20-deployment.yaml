@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-backend
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-backend
+  template:
+    metadata:
+      labels:
+        app: demo-backend
+      annotations:
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/role: "demo-backend"
+        vault.hashicorp.com/agent-pre-populate: "false"
+        vault.hashicorp.com/agent-inject-secret-db.txt: "database/creds/app-role"
+        vault.hashicorp.com/agent-inject-template-db.txt: |
+          {{- with secret "database/creds/app-role" -}}
+          username={{ .Data.username }}
+          password={{ .Data.password }}
+          lease_id={{ .LeaseID }}
+          lease_duration={{ .LeaseDuration }}
+          renewable={{ .Renewable }}
+          {{- end -}}
+    spec:
+      serviceAccountName: demo-backend
+      containers:
+        - name: app
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-lc"]
+          args:
+            - apk add --no-cache postgresql-client >/dev/null 2>&1 || true; python /app/app.py
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            timeoutSeconds: 1
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 2
+          volumeMounts:
+            - name: app-code
+              mountPath: /app/app.py
+              subPath: app.py
+              readOnly: true
+      volumes:
+        - name: app-code
+          configMap:
+            name: demo-backend-app
