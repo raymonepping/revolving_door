@@ -1,3 +1,47 @@
+# 6. Frontend + Door Operator (UI + Open/Close Workflows)
+
+This step adds:
+
+- A tiny NGINX frontend that polls `/api` every second and shows **🔓 OPENED** or **🔒 LOCKED**
+- A “door operator” mechanism in Kubernetes to flip the Vault Kubernetes auth role policy and restart the backend
+
+Prereqs:
+
+- Kind cluster is up
+- MetalLB is working
+- Traefik is installed and has an external IP
+- Vault is installed (dev mode is fine for this demo) and Kubernetes auth is configured
+- PostgreSQL is installed and Vault Database secrets engine is configured
+- `demo-backend` is deployed and reachable via `http://demo.local:18200/api`
+
+---
+
+## 1) Frontend architecture (what it is)
+
+The frontend is intentionally simple:
+
+- One Deployment: `vault-door-frontend` (1 replica)
+- One container: `nginx:1.27-alpine`
+- One ConfigMap: `vault-door-frontend` that contains `index.html`
+- The ConfigMap is mounted into NGINX at:
+  - `/usr/share/nginx/html/index.html` (via `subPath: index.html`)
+- No custom ServiceAccount, no Vault injection, no sidecars
+  - The Pod runs under `serviceAccountName: default`
+
+This matches the observed specs:
+
+- Deployment selector: `app=vault-door-frontend`
+- Pod label: `app=vault-door-frontend`
+- Volume: `web` from ConfigMap `vault-door-frontend`
+- VolumeMount: `/usr/share/nginx/html/index.html` (read-only)
+
+---
+
+## 2) Deploy the frontend (ConfigMap + Deployment + Service)
+
+This creates a ConfigMap with `index.html`, mounts it into NGINX, and exposes it with a Service.
+
+```bash
 cat <<'YAML' | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -54,7 +98,7 @@ data:
           </div>
 
           <div class="footer">
-            Tip: flip the Vault role policy between <code>app-db-read</code> and <code>deny-db-read</code>, then restart the pod.
+            Tip: flip the Vault role policy between <code>app-db-read</code> and <code>deny-db-read</code>, then restart the backend pod.
           </div>
         </div>
       </div>
@@ -148,7 +192,25 @@ spec:
     port: 80
     targetPort: 80
 YAML
+````
 
+Verify rollout:
+
+```bash
+kubectl rollout status deploy/vault-door-frontend -n default
+kubectl get pods -l app=vault-door-frontend -n default -o wide
+```
+
+---
+
+## 3) One Ingress for both `/` and `/api`
+
+This routes:
+
+* `/api` to `demo-backend`
+* `/` to `vault-door-frontend`
+
+```bash
 cat <<'YAML' | kubectl apply -f -
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -176,23 +238,36 @@ spec:
             port:
               number: 80
 YAML
+```
 
-kubectl -n vault exec vault-0 -- sh -lc '
-export VAULT_ADDR=http://127.0.0.1:8200
-export VAULT_TOKEN=root
-vault write auth/kubernetes/role/demo-backend \
-  bound_service_account_names="demo-backend" \
-  bound_service_account_namespaces="default" \
-  policies="app-db-read" \
-  ttl="24h" \
-  audience="https://kubernetes.default.svc.cluster.local"
-'
-kubectl delete pod -l app=demo-backend
+Quick checks:
 
+```bash
+command curl -sS http://demo.local:18200/api
+# UI:
+# http://demo.local:18200/
+```
 
-kubectl rollout restart deploy/demo-backend -n default
-kubectl rollout status deploy/demo-backend -n default
+---
 
+## 4) Door Operator (open/close workflows)
+
+You already have scripts in `./scripts/` that implement:
+
+* `open` -> set role policy to `app-db-read`, revoke DB leases, restart backend, wait for rollout
+* `close` -> set role policy to `deny-db-read`, revoke DB leases, restart backend, wait for rollout
+* `toggle` -> decides open vs close based on current `/api` state
+
+This section documents the Kubernetes pieces those scripts rely on.
+
+### 4.1 Demo-only note
+
+This approach uses a Kubernetes Secret containing the Vault root token. That is intentionally demo-only.
+In a real setup you would replace this with a tightly scoped Vault token, and likely avoid storing it in-cluster at all.
+
+### 4.2 RBAC + token Secret
+
+```bash
 cat <<'YAML' | kubectl apply -f -
 apiVersion: v1
 kind: Secret
@@ -238,100 +313,241 @@ roleRef:
   kind: Role
   name: door-operator
   apiGroup: rbac.authorization.k8s.io
----
+YAML
+```
+
+### 4.3 Create operator CronJobs (matches the running cluster)
+
+Your `revolving_door.sh` triggers Jobs from these CronJobs:
+
+* `kubectl create job --from=cronjob/door-open ...`
+* `kubectl create job --from=cronjob/door-close ...`
+
+So the operator definitions are stored as CronJobs that are suspended and effectively “manual only”.
+
+Key design choices (as deployed):
+
+* `suspend: true` (never auto-runs)
+* `schedule: 0 0 1 1 *` (once per year, but suspended anyway)
+* `initContainers` do the work:
+
+  * `vault-open|vault-close`: update Vault auth role policy and revoke DB leases
+  * `restart`: rollout restart backend
+  * `status`: wait for rollout status
+* A final `done` container runs `kubectl version --client=true` to complete the pod
+* `backoffLimit: 0` so failures fail fast
+* `concurrencyPolicy: Forbid` so you cannot overlap door operations
+* `ttlSecondsAfterFinished: 300` so Jobs are cleaned up
+
+Apply:
+
+```bash
+cat <<'YAML' | kubectl apply -f -
 apiVersion: batch/v1
-kind: Job
+kind: CronJob
 metadata:
   name: door-open
   namespace: default
 spec:
-  ttlSecondsAfterFinished: 120
-  template:
+  schedule: "0 0 1 1 *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 1
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
     spec:
-      serviceAccountName: door-operator
-      restartPolicy: Never
-      initContainers:
-        - name: vault-open
-          image: hashicorp/vault:1.20.4
-          env:
-            - name: VAULT_ADDR
-              value: "http://vault.vault.svc:8200"
-            - name: VAULT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: vault-root-token
-                  key: token
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -euo pipefail
-              echo "🔓 Setting Vault k8s role policy to app-db-read"
-              vault write auth/kubernetes/role/demo-backend \
-                bound_service_account_names="demo-backend" \
-                bound_service_account_namespaces="default" \
-                policies="app-db-read" \
-                ttl="24h" \
-                audience="https://kubernetes.default.svc.cluster.local"
-
-              echo "🧹 Revoking old DB leases so new creds appear fast (optional)"
-              vault lease revoke -prefix "database/creds/app-role" || true
-      containers:
-        - name: restart
-          image: bitnami/kubectl:1.35
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -euo pipefail
-              echo "🔄 Restarting demo-backend"
-              kubectl -n default rollout restart deploy/demo-backend
-              kubectl -n default rollout status deploy/demo-backend
-              echo "✅ Door open workflow complete"
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          serviceAccountName: door-operator
+          restartPolicy: Never
+          initContainers:
+            - name: vault-open
+              image: hashicorp/vault:1.20.4
+              env:
+                - name: VAULT_ADDR
+                  value: http://vault.vault.svc:8200
+                - name: VAULT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: vault-root-token
+                      key: token
+              command: ["/bin/sh","-lc"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "🔓 Setting Vault k8s role policy to app-db-read"
+                  vault write auth/kubernetes/role/demo-backend \
+                    bound_service_account_names="demo-backend" \
+                    bound_service_account_namespaces="default" \
+                    policies="app-db-read" \
+                    ttl="24h" \
+                    audience="https://kubernetes.default.svc.cluster.local"
+                  echo "♻️ Revoking DB leases (forces fresh creds)"
+                  vault lease revoke -prefix "database/creds/app-role" || true
+            - name: restart
+              image: rancher/kubectl:v1.35.0
+              command: ["kubectl"]
+              args: ["-n","default","rollout","restart","deploy/demo-backend"]
+            - name: status
+              image: rancher/kubectl:v1.35.0
+              command: ["kubectl"]
+              args: ["-n","default","rollout","status","deploy/demo-backend","--timeout=180s"]
+          containers:
+            - name: done
+              image: rancher/kubectl:v1.35.0
+              command: ["kubectl"]
+              args: ["version","--client=true"]
 ---
 apiVersion: batch/v1
-kind: Job
+kind: CronJob
 metadata:
   name: door-close
   namespace: default
 spec:
-  ttlSecondsAfterFinished: 120
-  template:
+  schedule: "0 0 1 1 *"
+  suspend: true
+  concurrencyPolicy: Forbid
+  failedJobsHistoryLimit: 1
+  successfulJobsHistoryLimit: 3
+  jobTemplate:
     spec:
-      serviceAccountName: door-operator
-      restartPolicy: Never
-      initContainers:
-        - name: vault-close
-          image: hashicorp/vault:1.20.4
-          env:
-            - name: VAULT_ADDR
-              value: "http://vault.vault.svc:8200"
-            - name: VAULT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: vault-root-token
-                  key: token
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -euo pipefail
-              echo "🔒 Setting Vault k8s role policy to deny-db-read"
-              vault write auth/kubernetes/role/demo-backend \
-                bound_service_account_names="demo-backend" \
-                bound_service_account_namespaces="default" \
-                policies="deny-db-read" \
-                ttl="24h" \
-                audience="https://kubernetes.default.svc.cluster.local"
-
-              echo "🧹 Revoking DB leases so the door locks immediately"
-              vault lease revoke -prefix "database/creds/app-role" || true
-      containers:
-        - name: restart
-          image: bitnami/kubectl:1.35
-          command: ["/bin/sh","-lc"]
-          args:
-            - |
-              set -euo pipefail
-              echo "🔄 Restarting demo-backend"
-              kubectl -n default rollout restart deploy/demo-backend
-              kubectl -n default rollout status deploy/demo-backend
-              echo "✅ Door close workflow complete"
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          serviceAccountName: door-operator
+          restartPolicy: Never
+          initContainers:
+            - name: vault-close
+              image: hashicorp/vault:1.20.4
+              env:
+                - name: VAULT_ADDR
+                  value: http://vault.vault.svc:8200
+                - name: VAULT_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: vault-root-token
+                      key: token
+              command: ["/bin/sh","-lc"]
+              args:
+                - |
+                  set -euo pipefail
+                  echo "🔒 Setting Vault k8s role policy to deny-db-read"
+                  vault write auth/kubernetes/role/demo-backend \
+                    bound_service_account_names="demo-backend" \
+                    bound_service_account_namespaces="default" \
+                    policies="deny-db-read" \
+                    ttl="24h" \
+                    audience="https://kubernetes.default.svc.cluster.local"
+                  echo "🧨 Revoking DB leases (locks immediately)"
+                  vault lease revoke -prefix "database/creds/app-role" || true
+            - name: restart
+              image: rancher/kubectl:v1.35.0
+              command: ["kubectl"]
+              args: ["-n","default","rollout","restart","deploy/demo-backend"]
+            - name: status
+              image: rancher/kubectl:v1.35.0
+              command: ["kubectl"]
+              args: ["-n","default","rollout","status","deploy/demo-backend","--timeout=180s"]
+          containers:
+            - name: done
+              image: rancher/kubectl:v1.35.0
+              command: ["kubectl"]
+              args: ["version","--client=true"]
 YAML
+```
+
+Verify:
+
+```bash
+kubectl -n default get cronjobs door-open door-close
+```
+
+---
+
+## 5) Run the demo
+
+Open the door:
+
+```bash
+./scripts/revolving_door.sh open
+./scripts/revolving_door.sh status
+```
+
+Close the door:
+
+```bash
+./scripts/revolving_door.sh close
+./scripts/revolving_door.sh status
+```
+
+Toggle based on current state:
+
+```bash
+./scripts/revolving_door.sh toggle
+```
+
+UI:
+
+* `http://demo.local:18200/`
+
+API:
+
+* `http://demo.local:18200/api`
+
+---
+
+## 6) Troubleshooting
+
+### Frontend is up, but UI shows LOCKED forever
+
+Check the API directly:
+
+```bash
+command curl -sS -i http://demo.local:18200/api | head -n 20
+```
+
+Check the backend pod and Vault Agent:
+
+```bash
+kubectl -n default get pods -l app=demo-backend -o wide
+POD="$(kubectl -n default get pod -l app=demo-backend -o jsonpath='{.items[0].metadata.name}')"
+kubectl -n default logs "$POD" -c vault-agent --tail=200
+```
+
+### `revolving_door.sh` says CronJob not found
+
+Confirm the CronJobs exist:
+
+```bash
+kubectl -n default get cronjobs | grep -E '^door-open|^door-close'
+```
+
+If they do not exist, re-apply section 4.3.
+
+### Door open/close Job fails
+
+List Jobs and inspect the most recent one:
+
+```bash
+kubectl -n default get jobs --sort-by=.metadata.creationTimestamp | tail
+kubectl -n default describe job/<job-name>
+```
+
+Check logs per initContainer:
+
+```bash
+kubectl -n default logs job/<job-name> -c vault-open   --tail=200
+kubectl -n default logs job/<job-name> -c vault-close  --tail=200
+kubectl -n default logs job/<job-name> -c restart      --tail=200
+kubectl -n default logs job/<job-name> -c status       --tail=200
+kubectl -n default logs job/<job-name> -c done         --tail=200
+```
+
+Common root causes:
+
+* Vault policy write fails (bad `VAULT_ADDR`, missing token, auth issues)
+* Backend rollout fails (deployment not found, RBAC missing verbs)
+* DB lease revoke fails (usually safe, it is `|| true`, but useful to see output)
